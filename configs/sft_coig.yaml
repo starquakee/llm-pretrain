@@ -1,0 +1,11 @@
+base_config: configs/pretrain_100m_muon.yaml
+dataset_id: BAAI/COIG
+revision: pin-at-prepare-time
+train_examples: 50000
+validation_examples: 1000
+max_seq_len: 1024
+epochs: 2
+learning_rate: 0.00005
+weight_decay: 0.01
+seed: 1337
+output_dir: ../llm-pretrain-artifacts/runs/sft-coig
