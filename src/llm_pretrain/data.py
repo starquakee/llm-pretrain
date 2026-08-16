@@ -12,6 +12,7 @@ import tempfile
 import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, cast
 
@@ -46,6 +47,7 @@ class SourceSpec:
     split: str = "train"
     files: tuple[SourceFile, ...] = ()
     provider: str = "huggingface"
+    file_glob: str | None = None
 
 
 # The symbolic Hugging Face revisions are resolved to immutable commit hashes by
@@ -62,6 +64,7 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
         requested_tokens=1_600_000_000,
         text_field="content",
         split="zh",
+        file_glob="data/ultrafineweb_zh/*.parquet",
     ),
     SourceSpec(
         name="wikimedia_zh",
@@ -83,6 +86,7 @@ DEFAULT_SOURCES: tuple[SourceSpec, ...] = (
         license="ODC-By v1.0; Common Crawl terms and source rights apply",
         token_weight=0.10,
         requested_tokens=200_000_000,
+        file_glob="sample/10BT/*.parquet",
     ),
 )
 
@@ -194,6 +198,50 @@ def resolve_source_revisions(
             resolved.append(SourceSpec(**source_payload))
         else:
             resolved.append(source)
+    return tuple(resolved)
+
+
+def resolve_huggingface_files(
+    sources: Sequence[SourceSpec],
+    *,
+    lister: Callable[[str, str], Sequence[str]] | None = None,
+) -> tuple[SourceSpec, ...]:
+    """Pin the exact parquet file list for configured Hugging Face sources."""
+    file_lister = lister
+    if file_lister is None:
+        try:
+            from huggingface_hub import HfApi
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("huggingface_hub is required to list dataset files") from exc
+        api = HfApi()
+
+        def list_dataset_files(repository: str, revision: str) -> Sequence[str]:
+            info = api.dataset_info(repository, revision=revision)
+            return [sibling.rfilename for sibling in info.siblings or ()]
+
+        file_lister = list_dataset_files
+
+    resolved: list[SourceSpec] = []
+    for source in sources:
+        if source.provider != "huggingface" or source.files:
+            resolved.append(source)
+            continue
+        if source.revision in {"main", "master"}:
+            raise ValueError("Resolve source revisions before listing dataset files")
+        if not source.file_glob:
+            raise ValueError(f"Hugging Face source {source.name} has no file_glob")
+        paths = sorted(
+            path
+            for path in file_lister(source.repository, source.revision)
+            if fnmatchcase(path, source.file_glob)
+        )
+        if not paths:
+            raise FileNotFoundError(
+                f"No files matched {source.file_glob!r} for Hugging Face source {source.name}"
+            )
+        payload = asdict(source)
+        payload["files"] = tuple(SourceFile(path=path) for path in paths)
+        resolved.append(SourceSpec(**payload))
     return tuple(resolved)
 
 
@@ -364,12 +412,52 @@ def iter_jsonl_documents(path: str | Path) -> Iterator[Document]:
                 raise ValueError(f"Malformed document at {path}:{line_number}") from exc
 
 
-def iter_huggingface_documents(source: SourceSpec, *, streaming: bool = True) -> Iterator[Document]:
+def iter_huggingface_documents(
+    source: SourceSpec,
+    *,
+    streaming: bool = True,
+    download_dir: str | Path | None = None,
+) -> Iterator[Document]:
     """Lazily stream one pinned Hugging Face source."""
     if source.provider != "huggingface":
         raise ValueError(f"{source.name} is not a Hugging Face source")
     if source.revision in {"main", "master"}:
         raise ValueError("Resolve the source revision before downloading data")
+    if source.files and download_dir is not None:
+        try:
+            import pyarrow.parquet as parquet
+            from huggingface_hub import hf_hub_download
+        except ImportError as exc:  # pragma: no cover - required production dependencies
+            raise RuntimeError("pyarrow and huggingface_hub are required for pinned files") from exc
+        local_root = Path(download_dir)
+        local_root.mkdir(parents=True, exist_ok=True)
+        for source_file in source.files:
+            local_path = hf_hub_download(
+                repo_id=source.repository,
+                filename=source_file.path,
+                repo_type="dataset",
+                revision=source.revision,
+                local_dir=local_root,
+            )
+            with Path(local_path).open("rb") as handle:
+                parquet_file = parquet.ParquetFile(handle)
+                columns = [source.text_field]
+                if "id" in parquet_file.schema_arrow.names:
+                    columns.append("id")
+                for batch in parquet_file.iter_batches(batch_size=1024, columns=columns):
+                    values = batch.to_pydict()
+                    texts = values[source.text_field]
+                    identifiers = values.get("id", [None] * len(texts))
+                    for text, identifier in zip(texts, identifiers, strict=True):
+                        if not isinstance(text, str):
+                            continue
+                        yield Document(
+                            text=text,
+                            source=source.name,
+                            document_id=None if identifier is None else str(identifier),
+                        )
+        return
+
     try:
         from datasets import load_dataset
     except ImportError as exc:  # pragma: no cover - optional dependency

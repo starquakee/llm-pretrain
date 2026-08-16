@@ -7,6 +7,8 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from llm_pretrain.data import (
@@ -14,15 +16,18 @@ from llm_pretrain.data import (
     DataCursor,
     Document,
     MemmapTokenDataset,
+    SourceFile,
     SourceManifest,
     allocate_token_quotas,
     document_sha256,
     download_wikimedia_dump,
+    iter_huggingface_documents,
     iter_wikimedia_documents,
     normalize_document,
     pack_mixed_token_shards,
     pack_token_shards,
     prepare_document_corpus,
+    resolve_huggingface_files,
     resolve_source_revisions,
     split_from_hash,
 )
@@ -79,6 +84,51 @@ def test_symbolic_revisions_are_resolved_and_manifest_round_trips(tmp_path: Path
     assert loaded == manifest
     assert resolved[0].revision == "b" * 40
     assert resolved[1].revision == "2026-08-01"
+
+
+def test_huggingface_file_globs_resolve_to_sorted_pinned_lists() -> None:
+    revisions = resolve_source_revisions(
+        DEFAULT_SOURCES,
+        resolver=lambda repository, revision: "b" * 40,
+    )
+
+    resolved = resolve_huggingface_files(
+        revisions,
+        lister=lambda repository, revision: (
+            "unrelated.parquet",
+            "data/ultrafineweb_zh/b.parquet",
+            "data/ultrafineweb_zh/a.parquet",
+        )
+        if repository == "openbmb/Ultra-FineWeb"
+        else ("sample/10BT/001.parquet",),
+    )
+
+    assert [file.path for file in resolved[0].files] == [
+        "data/ultrafineweb_zh/a.parquet",
+        "data/ultrafineweb_zh/b.parquet",
+    ]
+    assert [file.path for file in resolved[2].files] == ["sample/10BT/001.parquet"]
+
+
+def test_pinned_huggingface_parquet_is_read_in_batches(tmp_path: Path, monkeypatch) -> None:
+    shard = tmp_path / "fixture.parquet"
+    pq.write_table(
+        pa.table({"content": ["中文一", "中文二"], "id": ["first", "second"]}), shard
+    )
+    source = replace(
+        pinned_manifest().sources[0],
+        files=(SourceFile(path="data/fixture.parquet"),),
+    )
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **kwargs: str(shard))
+
+    documents = list(iter_huggingface_documents(source, download_dir=tmp_path / "downloads"))
+
+    assert documents == [
+        Document("中文一", source.name, "first"),
+        Document("中文二", source.name, "second"),
+    ]
 
 
 def test_normalization_hash_and_split_are_deterministic() -> None:

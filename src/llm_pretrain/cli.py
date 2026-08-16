@@ -39,6 +39,7 @@ from .data import (
     pack_mixed_token_shards,
     pack_token_shards,
     prepare_document_corpus,
+    resolve_huggingface_files,
     resolve_source_revisions,
 )
 from .doctor import DoctorError, require_training_ready, run_doctor
@@ -288,7 +289,9 @@ def _network_records(
     records: dict[str, Iterable[Document]] = {}
     for source in sources:
         if source.provider == "huggingface":
-            source_records: Iterable[Document] = iter_huggingface_documents(source)
+            source_records: Iterable[Document] = iter_huggingface_documents(
+                source, download_dir=downloads / source.name
+            )
         elif source.provider == "wikimedia_dump":
             dump = download_wikimedia_dump(source, downloads)
             source_records = iter_wikimedia_documents(source, dump)
@@ -316,7 +319,7 @@ def _command_data_prepare(args: argparse.Namespace) -> int:
         manifest = _local_source_manifest(local_inputs, seed)
         records = {name: _iter_local_jsonl(path) for name, path in local_inputs.items()}
     else:
-        sources = resolve_source_revisions(DEFAULT_SOURCES)
+        sources = resolve_huggingface_files(resolve_source_revisions(DEFAULT_SOURCES))
         manifest = SourceManifest(sources, seed=seed)
         records = _network_records(
             sources,
