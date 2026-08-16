@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Local training artifacts: never commit real data, tokenizers, logs, or weights.
+data/
+datasets/
+tokenized/
+tokenizers/
+checkpoints/
+runs/
+logs/
+wandb/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.idx
+*.parquet
+*.arrow
+*.tfrecord
+*.model
+*.vocab
+events.out.tfevents.*
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.secret
+*.token
+
+# Ralph runtime state that is machine-specific
+scripts/ralph/.last-branch
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

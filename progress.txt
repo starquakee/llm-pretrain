@@ -1,0 +1,10 @@
+# Ralph Progress: 100M Chinese LLM Pretraining Lab
+
+Started: 2026-08-16
+Source PRD: tasks/prd-100m-llm-pretrain.md
+
+## Codebase Patterns
+
+- Keep runtime artifacts outside the repository and make tests network-free.
+- Treat the PRD as authoritative; `prd.json` stores only execution state.
+

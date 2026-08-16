@@ -1,0 +1,60 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-pretrain"
+version = "0.1.0"
+description = "A reproducible single-GPU 100M Chinese language-model pretraining lab"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12,<3.13"
+authors = [{ name = "starquakee" }]
+dependencies = [
+  "datasets>=4.0,<5",
+  "huggingface-hub>=0.34,<1",
+  "numpy>=2.2,<3",
+  "psutil>=6.1,<8",
+  "pyarrow>=18,<22",
+  "pyyaml>=6.0,<7",
+  "safetensors>=0.5,<1",
+  "sentencepiece>=0.2,<1",
+  "tensorboard>=2.18,<3",
+  "torch>=2.13,<2.14",
+  "tqdm>=4.67,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyright>=1.1.400,<2",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+llm-pretrain = "llm_pretrain.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_pretrain"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+markers = [
+  "gpu: requires an NVIDIA CUDA GPU",
+  "integration: requires optional local services or larger fixtures",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+include = ["src", "tests", "scripts"]
+
