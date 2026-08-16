@@ -1,0 +1,58 @@
+model:
+  vocab_size: 24576
+  max_seq_len: 1024
+  n_layers: 12
+  d_model: 768
+  n_heads: 12
+  intermediate_size: 1920
+  rope_theta: 10000.0
+  rms_norm_eps: 0.000001
+  dropout: 0.0
+  bias: false
+  activation_checkpointing: true
+data:
+  data_dir: ../llm-pretrain-artifacts/data
+  sequence_length: 1024
+  tokenizer_vocab_size: 24576
+  validation_tokens: 10000000
+  shard_size_tokens: 100000000
+  chinese_web_ratio: 0.8
+  chinese_wikipedia_ratio: 0.1
+  english_web_ratio: 0.1
+  seed: 1337
+  num_workers: 4
+optimizer:
+  optimizer: muon
+  muon_lr: 0.02
+  muon_momentum: 0.95
+  muon_nesterov: true
+  muon_ns_steps: 5
+  muon_weight_decay: 0.01
+  muon_lr_adjustment: original
+  auxiliary_lr: 0.0003
+  auxiliary_betas: [0.9, 0.95]
+  auxiliary_weight_decay: 0.01
+  adamw_lr: 0.0006
+  adamw_betas: [0.9, 0.95]
+  adamw_weight_decay: 0.1
+  warmup_ratio: 0.02
+  min_lr_ratio: 0.1
+train:
+  output_dir: ../llm-pretrain-artifacts/runs/pretrain-muon
+  seed: 1337
+  max_tokens: 2000000000
+  time_budget_hours: 120.0
+  global_batch_tokens: 131072
+  micro_batch_sequences: 0
+  micro_batch_candidates: [1, 2, 4, 8]
+  memory_margin_gb: 0.7
+  eval_interval_steps: 500
+  checkpoint_interval_steps: 500
+  keep_last_checkpoints: 3
+  gradient_clip_norm: 1.0
+  dtype: bfloat16
+  device: cuda
+  compile_model: true
+  log_interval_steps: 10
+  hardware_peak_flops: 88000000000000.0
+  model_flops_per_token: 0.0
