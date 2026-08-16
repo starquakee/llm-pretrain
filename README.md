@@ -48,13 +48,13 @@ revision、许可和来源，但网页数据集的整理许可不替代每个原
 ```bash
 uv run llm-pretrain --help
 uv run llm-pretrain doctor --strict
-uv run llm-pretrain data prepare --config configs/data_sources.yaml
+uv run llm-pretrain data prepare --config configs/data_sources.yaml --allow-network
 uv run llm-pretrain tokenizer train --config configs/tokenizer_24k.yaml
 uv run llm-pretrain tokenizer eval --config configs/tokenizer_24k.yaml
 uv run llm-pretrain data tokenize --config configs/data_sources.yaml
 uv run llm-pretrain train ab --config configs/pretrain_100m_muon.yaml
 uv run llm-pretrain evaluate --config configs/pretrain_100m_muon.yaml
-uv run llm-pretrain train sft --config configs/sft_coig.yaml
+uv run llm-pretrain train sft --config configs/sft_coig.yaml --allow-network
 uv run llm-pretrain generate --config configs/pretrain_100m_muon.yaml --prompt "杭州是一座"
 ```
 
@@ -63,6 +63,10 @@ uv run llm-pretrain generate --config configs/pretrain_100m_muon.yaml --prompt "
 ```bash
 export LLM_PRETRAIN_ARTIFACT_ROOT=/mnt/d/llm-pretrain-artifacts
 ```
+
+数据准备和 COIG 下载默认离线；只有明确传入 `--allow-network` 才会访问远端。已有本地
+JSONL 时，分别使用 `data prepare --input SOURCE=PATH` 和 `train sft --records PATH`，无需
+联网开关。
 
 ### 正式预训练
 
@@ -116,4 +120,3 @@ Ralph 在 `ralph/100m-llm-pretrain` 分支按 `prd.json` 顺序一次完成一�
 ## License
 
 代码使用 Apache License 2.0。数据集、数据内容和未来训练产物受各自许可与来源条款约束。
-
