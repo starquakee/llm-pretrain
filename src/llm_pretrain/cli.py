@@ -31,10 +31,12 @@ from .data import (
     MemmapTokenDataset,
     SourceManifest,
     SourceSpec,
+    allocate_token_quotas,
     download_wikimedia_dump,
     iter_huggingface_documents,
     iter_jsonl_documents,
     iter_wikimedia_documents,
+    pack_mixed_token_shards,
     pack_token_shards,
     prepare_document_corpus,
     resolve_source_revisions,
@@ -434,19 +436,44 @@ def _command_data_tokenize(args: argparse.Namespace) -> int:
     tokenizer = SentencePieceTokenizer.from_file(tokenizer_path)
     sequence_length = int(args.sequence_length or settings.get("sequence_length", 1024))
     shard_capacity = int(args.shard_size_tokens or settings.get("shard_size_tokens", 100_000_000))
+    source_manifest_path = prepared / "sources.json"
+    source_manifest = (
+        SourceManifest.read(source_manifest_path) if source_manifest_path.is_file() else None
+    )
+    default_train_tokens: int | None = None
+    if source_manifest is not None:
+        requested = [source.requested_tokens for source in source_manifest.sources]
+        if requested and all(value is not None for value in requested):
+            default_train_tokens = sum(int(value) for value in requested if value is not None)
+    train_tokens = args.train_tokens or default_train_tokens
+    validation_tokens = args.validation_tokens or int(settings.get("validation_tokens", 10_000_000))
     manifests = {}
     for split in ("train", "validation"):
         source = prepared / f"{split}.jsonl"
         if not source.is_file():
             raise FileNotFoundError(f"prepared split does not exist: {source}")
-        manifests[split] = pack_token_shards(
-            iter_jsonl_documents(source),
-            tokenizer,
-            output,
-            split=split,
-            sequence_length=sequence_length,
-            shard_token_capacity=shard_capacity,
-        ).to_dict()
+        target_tokens = train_tokens if split == "train" else validation_tokens
+        if source_manifest is not None and target_tokens is not None:
+            quotas = allocate_token_quotas(target_tokens, source_manifest.sources)
+            manifest = pack_mixed_token_shards(
+                iter_jsonl_documents(source),
+                tokenizer,
+                output,
+                split=split,
+                source_token_quotas=quotas,
+                sequence_length=sequence_length,
+                shard_token_capacity=shard_capacity,
+            )
+        else:
+            manifest = pack_token_shards(
+                iter_jsonl_documents(source),
+                tokenizer,
+                output,
+                split=split,
+                sequence_length=sequence_length,
+                shard_token_capacity=shard_capacity,
+            )
+        manifests[split] = manifest.to_dict()
     _json_dump(manifests)
     return 0
 
@@ -983,6 +1010,8 @@ def build_parser() -> argparse.ArgumentParser:
     tokenize.add_argument("--tokenizer")
     tokenize.add_argument("--sequence-length", type=int)
     tokenize.add_argument("--shard-size-tokens", type=int)
+    tokenize.add_argument("--train-tokens", type=int)
+    tokenize.add_argument("--validation-tokens", type=int)
     tokenize.set_defaults(handler=_command_data_tokenize)
 
     tokenizer = commands.add_parser("tokenizer", help="train or evaluate SentencePiece")
