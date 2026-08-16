@@ -15,6 +15,7 @@ from llm_pretrain.tokenization import (
     USER_TOKEN,
     SentencePieceTokenizer,
     evaluate_tokenizer,
+    write_source_balanced_tokenizer_corpus,
     write_tokenizer_corpus,
 )
 
@@ -116,3 +117,26 @@ def test_tokenizer_corpus_writer_uses_one_line_per_nonempty_document(tmp_path) -
     path, count = write_tokenizer_corpus(["甲\n乙", "  ", "丙"], tmp_path / "train.txt")
     assert count == 2
     assert path.read_text(encoding="utf-8") == "甲 乙\n丙\n"
+
+
+def test_source_balanced_tokenizer_corpus_is_text_only_and_bounded(tmp_path) -> None:
+    documents = [
+        ("zh", "中文甲"),
+        ("zh", "中文乙"),
+        ("wiki", "百科"),
+        ("en", "hello"),
+    ]
+
+    path, stats = write_source_balanced_tokenizer_corpus(
+        documents,
+        tmp_path / "train.txt",
+        source_weights={"zh": 0.8, "wiki": 0.1, "en": 0.1},
+        max_utf8_bytes=100,
+    )
+
+    contents = path.read_text(encoding="utf-8")
+    assert contents == "中文甲\n中文乙\n百科\nhello\n"
+    assert stats.documents == 4
+    assert stats.utf8_bytes == len(contents.encode("utf-8"))
+    assert stats.source_documents == {"zh": 2, "wiki": 1, "en": 1}
+    assert stats.utf8_bytes <= 100

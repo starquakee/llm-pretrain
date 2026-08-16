@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import yaml
 
 from llm_pretrain import cli
 from llm_pretrain.config import ConfigError
+from llm_pretrain.data import DEFAULT_SOURCES, SourceManifest
 
 
 def _write_pretrain_config(path: Path, artifact_root: Path) -> Path:
@@ -162,6 +164,70 @@ def test_data_prepare_accepts_a_small_local_fixture(tmp_path, capsys) -> None:
     assert (output / "train.jsonl").is_file()
     assert (output / "sources.json").is_file()
     assert not (output / "downloads").exists()
+
+
+def test_network_source_byte_limiter_includes_boundary_document() -> None:
+    documents = [
+        cli.Document("abc", "source", "1"),
+        cli.Document("中文", "source", "2"),
+        cli.Document("unused", "source", "3"),
+    ]
+
+    limited = list(cli._limit_documents_by_utf8_bytes(documents, 5))
+
+    assert [document.document_id for document in limited] == ["1", "2"]
+
+
+def test_tokenizer_train_extracts_bounded_text_only_balanced_corpus(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    prepared = artifact_root / "data" / "prepared"
+    prepared.mkdir(parents=True)
+    sources = tuple(
+        replace(source, revision=("a" * 40 if source.revision == "main" else source.revision))
+        for source in DEFAULT_SOURCES
+    )
+    SourceManifest(sources=sources, seed=1337).write(prepared / "sources.json")
+    rows = [
+        {"id": "secret-ultra", "sha256": "u", "source": sources[0].name, "text": "中文网页"},
+        {"id": "secret-wiki", "sha256": "w", "source": sources[1].name, "text": "百科"},
+        {"id": "secret-en", "sha256": "e", "source": sources[2].name, "text": "hello"},
+    ]
+    (prepared / "train.jsonl").write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8"
+    )
+    config = tmp_path / "tokenizer.yaml"
+    config.write_text(
+        yaml.safe_dump({"vocab_size": 263, "training_corpus_bytes": 100}), encoding="utf-8"
+    )
+    captured: dict[str, str] = {}
+
+    def fake_train(input_files, model_prefix, **kwargs):
+        sample = Path(input_files[0])
+        captured["sample"] = sample.read_text(encoding="utf-8")
+        model = Path(model_prefix).with_suffix(".model")
+        vocab = Path(model_prefix).with_suffix(".vocab")
+        model.write_bytes(b"model")
+        vocab.write_text("vocab", encoding="utf-8")
+        return model, vocab
+
+    monkeypatch.setattr(cli, "train_sentencepiece", fake_train)
+    result = cli.main(
+        [
+            "--artifact-root",
+            str(artifact_root),
+            "tokenizer",
+            "train",
+            "--config",
+            str(config),
+        ]
+    )
+
+    assert result == 0, capsys.readouterr().err
+    assert captured["sample"] == "中文网页\n百科\nhello\n"
+    assert "secret-" not in captured["sample"]
+    assert '\"source\"' not in captured["sample"]
 
 
 @pytest.mark.parametrize(

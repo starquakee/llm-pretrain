@@ -410,6 +410,13 @@ def download_wikimedia_dump(
     output.mkdir(parents=True, exist_ok=True)
     destination = output / source_file.path
     temporary = destination.with_suffix(destination.suffix + ".part")
+    if destination.is_file():
+        size_matches = (
+            source_file.size_bytes is None or destination.stat().st_size == source_file.size_bytes
+        )
+        hash_matches = source_file.sha256 is None or _file_sha256(destination) == source_file.sha256
+        if size_matches and hash_matches:
+            return destination
     request = Request(url, headers={"User-Agent": "llm-pretrain/0.1 data preparation"})
     try:
         with urlopen(request) as response, temporary.open("wb") as handle:

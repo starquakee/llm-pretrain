@@ -3,6 +3,7 @@ input_globs:
 output_prefix: ../llm-pretrain-artifacts/data/tokenizer/chinese-24k
 vocab_size: 24576
 character_coverage: 0.9995
+training_corpus_bytes: 268435456
 model_type: bpe
 byte_fallback: true
 seed: 1337

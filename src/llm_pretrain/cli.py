@@ -57,6 +57,8 @@ from .tokenization import (
     SentencePieceTokenizer,
     evaluate_tokenizer,
     train_sentencepiece,
+    write_source_balanced_tokenizer_corpus,
+    write_tokenizer_corpus,
 )
 from .training import (
     ABRunMetrics,
@@ -261,18 +263,41 @@ def _command_doctor(args: argparse.Namespace) -> int:
     return 0 if report.ready else 1
 
 
+def _limit_documents_by_utf8_bytes(
+    records: Iterable[Document], max_utf8_bytes: int
+) -> Iterator[Document]:
+    """Stop a streaming source after a deterministic raw-text byte budget."""
+    if max_utf8_bytes <= 0:
+        raise ValueError("source UTF-8 byte budget must be positive")
+    consumed = 0
+    for document in records:
+        consumed += len(document.text.encode("utf-8"))
+        yield document
+        if consumed >= max_utf8_bytes:
+            return
+
+
 def _network_records(
-    sources: Sequence[SourceSpec], downloads: Path
+    sources: Sequence[SourceSpec],
+    downloads: Path,
+    *,
+    source_utf8_bytes_per_token: float,
 ) -> dict[str, Iterable[Document]]:
+    if source_utf8_bytes_per_token <= 0:
+        raise ConfigError("source_utf8_bytes_per_token must be positive")
     records: dict[str, Iterable[Document]] = {}
     for source in sources:
         if source.provider == "huggingface":
-            records[source.name] = iter_huggingface_documents(source)
+            source_records: Iterable[Document] = iter_huggingface_documents(source)
         elif source.provider == "wikimedia_dump":
             dump = download_wikimedia_dump(source, downloads)
-            records[source.name] = iter_wikimedia_documents(source, dump)
+            source_records = iter_wikimedia_documents(source, dump)
         else:
             raise ValueError(f"unsupported remote source provider: {source.provider}")
+        if source.requested_tokens is not None:
+            byte_budget = math.ceil(source.requested_tokens * source_utf8_bytes_per_token)
+            source_records = _limit_documents_by_utf8_bytes(source_records, byte_budget)
+        records[source.name] = source_records
     return records
 
 
@@ -293,7 +318,11 @@ def _command_data_prepare(args: argparse.Namespace) -> int:
     else:
         sources = resolve_source_revisions(DEFAULT_SOURCES)
         manifest = SourceManifest(sources, seed=seed)
-        records = _network_records(sources, output / "downloads")
+        records = _network_records(
+            sources,
+            output / "downloads",
+            source_utf8_bytes_per_token=float(settings.get("source_utf8_bytes_per_token", 8.0)),
+        )
     stats = prepare_document_corpus(
         records,
         output,
@@ -376,8 +405,37 @@ def _command_tokenizer_train(args: argparse.Namespace) -> int:
         raise ValueError("tokenizer model prefix is required via --model-prefix or config")
     prefix = _resolve_path(str(prefix_value))
     _require_external_directory(prefix.parent, label="tokenizer output directory")
+    sample_bytes = int(settings.get("training_corpus_bytes", 256 * 1024 * 1024))
+    if sample_bytes <= 0:
+        raise ConfigError("tokenizer training_corpus_bytes must be positive")
+    corpus_path = prefix.parent / f"{prefix.name}-train.txt"
+    manifests = {path.parent / "sources.json" for path in inputs if path.suffix == ".jsonl"}
+    all_jsonl = all(path.suffix == ".jsonl" for path in inputs)
+    manifest_path = manifests.pop() if len(manifests) == 1 and all_jsonl else None
+    if manifest_path is not None and manifest_path.is_file():
+        manifest = SourceManifest.read(manifest_path)
+        document_stream = (
+            (document.source, document.text)
+            for input_path in inputs
+            for document in iter_jsonl_documents(input_path)
+        )
+        corpus_path, corpus_stats = write_source_balanced_tokenizer_corpus(
+            document_stream,
+            corpus_path,
+            source_weights={source.name: source.token_weight for source in manifest.sources},
+            max_utf8_bytes=sample_bytes,
+        )
+        corpus_details: dict[str, Any] = asdict(corpus_stats)
+    else:
+        corpus_path, document_count = write_tokenizer_corpus(
+            _iter_texts(inputs), corpus_path, max_utf8_bytes=sample_bytes
+        )
+        corpus_details = {
+            "documents": document_count,
+            "utf8_bytes": corpus_path.stat().st_size,
+        }
     model_path, vocab_path = train_sentencepiece(
-        inputs,
+        [corpus_path],
         prefix,
         vocab_size=int(
             args.vocab_size if args.vocab_size is not None else settings.get("vocab_size", 24_576)
@@ -389,7 +447,14 @@ def _command_tokenizer_train(args: argparse.Namespace) -> int:
         ),
         num_threads=args.num_threads,
     )
-    _json_dump({"model": str(model_path), "vocab": str(vocab_path)})
+    _json_dump(
+        {
+            "model": str(model_path),
+            "vocab": str(vocab_path),
+            "training_corpus": str(corpus_path),
+            "training_corpus_stats": corpus_details,
+        }
+    )
     return 0
 
 

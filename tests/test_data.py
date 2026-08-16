@@ -17,6 +17,7 @@ from llm_pretrain.data import (
     SourceManifest,
     allocate_token_quotas,
     document_sha256,
+    download_wikimedia_dump,
     iter_wikimedia_documents,
     normalize_document,
     pack_mixed_token_shards,
@@ -132,6 +133,17 @@ def test_wikimedia_dump_stream_skips_redirects_and_non_articles(tmp_path: Path) 
     source = next(source for source in DEFAULT_SOURCES if source.name == "wikimedia_zh")
     documents = list(iter_wikimedia_documents(source, dump))
     assert documents == [Document(text="article", source="wikimedia_zh", document_id="1")]
+
+
+def test_wikimedia_download_reuses_an_existing_atomic_destination(tmp_path: Path) -> None:
+    source = next(
+        source for source in pinned_manifest().sources if source.provider == "wikimedia_dump"
+    )
+    destination = tmp_path / source.files[0].path
+    destination.write_bytes(b"already complete")
+
+    assert download_wikimedia_dump(source, tmp_path) == destination
+    assert destination.read_bytes() == b"already complete"
 
 
 def test_packer_writes_eos_continuous_uint32_shards(tmp_path: Path) -> None:

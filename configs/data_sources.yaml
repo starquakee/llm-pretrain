@@ -2,6 +2,7 @@ seed: 1337
 validation_tokens: 10000000
 sequence_length: 1024
 shard_size_tokens: 100000000
+source_utf8_bytes_per_token: 8.0
 artifact_root: ../llm-pretrain-artifacts/data
 sources:
   - name: ultra_fineweb_zh

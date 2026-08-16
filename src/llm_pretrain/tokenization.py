@@ -8,7 +8,10 @@ unit tests usable before the optional native dependency is installed.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Sequence
+import shutil
+import tempfile
+from collections.abc import Iterable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -134,26 +137,143 @@ class SentencePieceTokenizer:
             raise ValueError(f"Tokenizer special-token ids are incompatible ({details})")
 
 
-def write_tokenizer_corpus(texts: Iterable[str], path: str | Path) -> tuple[Path, int]:
+def _tokenizer_corpus_line(text: str) -> bytes | None:
+    if not isinstance(text, str):
+        raise TypeError("Tokenizer corpus entries must be strings")
+    canonical = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not canonical:
+        return None
+    return (canonical.replace("\n", " ") + "\n").encode("utf-8")
+
+
+def write_tokenizer_corpus(
+    texts: Iterable[str],
+    path: str | Path,
+    *,
+    max_utf8_bytes: int | None = None,
+) -> tuple[Path, int]:
     """Write training-partition documents as SentencePiece input, atomically."""
+    if max_utf8_bytes is not None and max_utf8_bytes <= 0:
+        raise ValueError("max_utf8_bytes must be positive")
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(output.suffix + ".tmp")
     document_count = 0
+    written_bytes = 0
     try:
-        with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        with temporary.open("wb") as handle:
             for text in texts:
-                if not isinstance(text, str):
-                    raise TypeError("Tokenizer corpus entries must be strings")
-                canonical = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-                if not canonical:
+                line = _tokenizer_corpus_line(text)
+                if line is None:
                     continue
-                handle.write(canonical.replace("\n", " ") + "\n")
+                if max_utf8_bytes is not None and written_bytes + len(line) > max_utf8_bytes:
+                    continue
+                handle.write(line)
                 document_count += 1
+                written_bytes += len(line)
+                if max_utf8_bytes is not None and written_bytes == max_utf8_bytes:
+                    break
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, output)
     finally:
         temporary.unlink(missing_ok=True)
     return output, document_count
+
+
+@dataclass(frozen=True)
+class TokenizerCorpusStats:
+    documents: int
+    utf8_bytes: int
+    source_documents: dict[str, int]
+    source_utf8_bytes: dict[str, int]
+
+
+def write_source_balanced_tokenizer_corpus(
+    documents: Iterable[tuple[str, str]],
+    path: str | Path,
+    *,
+    source_weights: Mapping[str, float],
+    max_utf8_bytes: int,
+) -> tuple[Path, TokenizerCorpusStats]:
+    """Write a bounded, deterministic text-only sample with per-source byte quotas.
+
+    Prepared JSONL is source-sequential. Separate on-disk spools keep every
+    configured source represented without retaining the sample in RAM or
+    teaching SentencePiece JSON keys, hashes, and document identifiers.
+    """
+    if max_utf8_bytes <= 0:
+        raise ValueError("max_utf8_bytes must be positive")
+    if not source_weights or any(weight <= 0 for weight in source_weights.values()):
+        raise ValueError("source_weights must contain positive weights")
+    total_weight = sum(source_weights.values())
+    if abs(total_weight - 1.0) > 1e-9:
+        raise ValueError("source_weights must sum to 1.0")
+
+    source_names = list(source_weights)
+    quotas: dict[str, int] = {}
+    allocated = 0
+    for source in source_names[:-1]:
+        quota = int(max_utf8_bytes * source_weights[source])
+        quotas[source] = quota
+        allocated += quota
+    quotas[source_names[-1]] = max_utf8_bytes - allocated
+    if any(quota <= 0 for quota in quotas.values()):
+        raise ValueError("max_utf8_bytes is too small to represent every source")
+
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    counts = dict.fromkeys(source_names, 0)
+    byte_counts = dict.fromkeys(source_names, 0)
+    try:
+        with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as scratch:
+            scratch_path = Path(scratch)
+            spool_paths = {
+                source: scratch_path / f"source-{index:04d}.txt"
+                for index, source in enumerate(source_names)
+            }
+            with ExitStack() as stack:
+                handles = {
+                    source: stack.enter_context(spool_paths[source].open("wb"))
+                    for source in source_names
+                }
+                for source, text in documents:
+                    if source not in quotas:
+                        raise ValueError(f"Tokenizer document has unknown source: {source}")
+                    line = _tokenizer_corpus_line(text)
+                    if line is None:
+                        continue
+                    if byte_counts[source] + len(line) > quotas[source]:
+                        continue
+                    handles[source].write(line)
+                    counts[source] += 1
+                    byte_counts[source] += len(line)
+                    if all(
+                        byte_counts[name] >= max(1, int(quotas[name] * 0.99))
+                        for name in source_names
+                    ):
+                        break
+
+            missing = [source for source, count in counts.items() if count == 0]
+            if missing:
+                raise ValueError(f"Tokenizer sample has no usable documents for sources: {missing}")
+            with temporary.open("wb") as destination:
+                for source in source_names:
+                    with spool_paths[source].open("rb") as source_file:
+                        shutil.copyfileobj(source_file, destination, length=1024 * 1024)
+                destination.flush()
+                os.fsync(destination.fileno())
+            os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    return output, TokenizerCorpusStats(
+        documents=sum(counts.values()),
+        utf8_bytes=sum(byte_counts.values()),
+        source_documents=counts,
+        source_utf8_bytes=byte_counts,
+    )
 
 
 def train_sentencepiece(
