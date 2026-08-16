@@ -8,3 +8,53 @@ Source PRD: tasks/prd-100m-llm-pretrain.md
 - Keep runtime artifacts outside the repository and make tests network-free.
 - Treat the PRD as authoritative; `prd.json` stores only execution state.
 
+## 2026-08-17 — US-001
+
+- Added locked Python 3.12 packaging, WSL/CUDA/BF16/Muon/SDPA/compile/resource doctor, Apache-2.0 guards, and synthetic tests.
+- Evidence: strict doctor returned `ready: true` on RTX 4060 Ti; focused doctor tests passed.
+
+## 2026-08-17 — US-002
+
+- Added strict YAML dataclasses and the 12-layer RoPE/RMSNorm/SwiGLU decoder with tied embeddings.
+- Evidence: exact parameter count `100,289,280`; eager and compiled BF16 full-model backward passed.
+
+## 2026-08-17 — US-003
+
+- Added fixed-ID SentencePiece BPE training/evaluation, byte fallback, train-only corpus writer, and compression metrics.
+- Evidence: tokenizer fixture tests passed without network access.
+
+## 2026-08-17 — US-004
+
+- Added pinned 80/10/10 source manifests with requested token counts, Wikimedia/Hugging Face readers, global exact dedupe, hash split, uint32 shards, and resumable cursors.
+- Evidence: data, split, packing, manifest, and cursor tests passed.
+
+## 2026-08-17 — US-005
+
+- Added disjoint Muon/auxiliary AdamW ownership, AdamW baseline, warmup-cosine scheduling, BF16 accumulation, micro-batch probing, and safe OOM/non-finite exits.
+- Evidence: default context-1024 probe selected micro-batch 8; a full Muon step retained 2.84 GiB free VRAM.
+
+## 2026-08-17 — US-006
+
+- Added atomic full-state checkpoints, latest-three-plus-best retention, JSONL/TensorBoard metrics, MFU estimate, and NVIDIA temperature telemetry.
+- Evidence: CUDA RNG map-location defect found and fixed; full GPU checkpoint round-trip passed.
+
+## 2026-08-17 — US-007
+
+- Added deterministic Muon/AdamW A/B runs, gate recalculation, one bounded LR calibration, held-out evaluation, and batch-aligned formal token budgeting.
+- Evidence: gate, calibration, stop, evaluation, and budget tests passed.
+
+## 2026-08-17 — US-008
+
+- Added deterministic COIG 50K/1K selection, assistant-only labels, full-parameter AdamW SFT, and seeded local generation.
+- Evidence: SFT response loss and generation tests passed on CPU.
+
+## 2026-08-17 — US-009
+
+- Added complete offline-first CLI, external-artifact protection, documentation, Ralph runner, and tracked-file residue audit.
+- Evidence: Ralph dry-run passed; Ruff and Pyright were clean; Windows suite `84 passed, 1 CUDA skipped`; WSL suite `85 passed`; tracked-file audit passed.
+
+## Durable Lessons
+
+- `torch.load(..., map_location="cuda")` moves serialized CUDA RNG byte tensors to CUDA; move them back to CPU before `set_rng_state_all`.
+- Skip eager tensor-to-Python validation branches while Dynamo is compiling to avoid graph breaks; retain finite-loss checks in the trainer.
+- Keep Windows and WSL environments separate (`.venv` and `.venv-wsl`) and never install a Linux NVIDIA driver inside WSL.
