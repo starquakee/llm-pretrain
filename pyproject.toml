@@ -57,4 +57,5 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 include = ["src", "tests", "scripts"]
-
+venvPath = "."
+venv = ".venv"
