@@ -477,6 +477,7 @@ def download_huggingface_file(
     output_dir: str | Path,
     *,
     chunk_size: int = 8 * 1024 * 1024,
+    max_attempts: int = 8,
 ) -> Path:
     """Download one pinned Hub file with resumable, atomic HTTP writes."""
     if source.provider != "huggingface":
@@ -485,6 +486,8 @@ def download_huggingface_file(
         raise ValueError("Resolve the source revision before downloading data")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
+    if max_attempts <= 0:
+        raise ValueError("max_attempts must be positive")
     output = Path(output_dir).resolve()
     destination = (output / source_file.path).resolve()
     if not destination.is_relative_to(output):
@@ -494,56 +497,71 @@ def download_huggingface_file(
         return destination
 
     temporary = destination.with_suffix(destination.suffix + ".part")
-    existing_bytes = temporary.stat().st_size if temporary.is_file() else 0
     endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
     repository = quote(source.repository, safe="/")
     revision = quote(source.revision, safe="")
     filename = quote(source_file.path, safe="/")
     url = f"{endpoint}/datasets/{repository}/resolve/{revision}/{filename}"
-    headers = {"User-Agent": "llm-pretrain/0.1 pinned data download"}
-    if existing_bytes:
-        headers["Range"] = f"bytes={existing_bytes}-"
-    request = Request(url, headers=headers)
-    with urlopen(request, timeout=60) as response:
-        status = int(getattr(response, "status", response.getcode()))
-        append = existing_bytes > 0 and status == 206
-        initial_bytes = existing_bytes if append else 0
-        content_range = response.headers.get("Content-Range")
-        content_length = response.headers.get("Content-Length")
-        expected_bytes: int | None = None
-        if content_range and "/" in content_range:
-            total = content_range.rsplit("/", maxsplit=1)[1]
-            if total.isdigit():
-                expected_bytes = int(total)
-        elif content_length and content_length.isdigit():
-            expected_bytes = initial_bytes + int(content_length)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            existing_bytes = temporary.stat().st_size if temporary.is_file() else 0
+            headers = {"User-Agent": "llm-pretrain/0.1 pinned data download"}
+            if existing_bytes:
+                headers["Range"] = f"bytes={existing_bytes}-"
+            request = Request(url, headers=headers)
+            with urlopen(request, timeout=60) as response:
+                status = int(getattr(response, "status", response.getcode()))
+                append = existing_bytes > 0 and status == 206
+                initial_bytes = existing_bytes if append else 0
+                content_range = response.headers.get("Content-Range")
+                content_length = response.headers.get("Content-Length")
+                expected_bytes: int | None = None
+                if content_range and "/" in content_range:
+                    total = content_range.rsplit("/", maxsplit=1)[1]
+                    if total.isdigit():
+                        expected_bytes = int(total)
+                elif content_length and content_length.isdigit():
+                    expected_bytes = initial_bytes + int(content_length)
 
-        mode = "ab" if append else "wb"
-        downloaded = initial_bytes
-        next_report = downloaded + 256 * 1024 * 1024
-        report_started = time.monotonic()
-        with temporary.open(mode) as handle:
-            while chunk := response.read(chunk_size):
-                handle.write(chunk)
-                downloaded += len(chunk)
-                if downloaded >= next_report or time.monotonic() - report_started >= 60:
-                    total_label = str(expected_bytes) if expected_bytes is not None else "unknown"
-                    print(
-                        f"download {source.name}/{source_file.path}: "
-                        f"{downloaded}/{total_label} bytes",
-                        flush=True,
-                    )
-                    next_report = downloaded + 256 * 1024 * 1024
-                    report_started = time.monotonic()
-            handle.flush()
-            os.fsync(handle.fileno())
-    if expected_bytes is not None and temporary.stat().st_size != expected_bytes:
-        raise OSError(
-            f"Incomplete Hugging Face file {source_file.path}: "
-            f"got {temporary.stat().st_size}, expected {expected_bytes} bytes"
-        )
-    os.replace(temporary, destination)
-    return destination
+                mode = "ab" if append else "wb"
+                downloaded = initial_bytes
+                next_report = downloaded + 256 * 1024 * 1024
+                report_started = time.monotonic()
+                with temporary.open(mode) as handle:
+                    while chunk := response.read(chunk_size):
+                        handle.write(chunk)
+                        downloaded += len(chunk)
+                        if downloaded >= next_report or time.monotonic() - report_started >= 60:
+                            total_label = (
+                                str(expected_bytes) if expected_bytes is not None else "unknown"
+                            )
+                            print(
+                                f"download {source.name}/{source_file.path}: "
+                                f"{downloaded}/{total_label} bytes",
+                                flush=True,
+                            )
+                            next_report = downloaded + 256 * 1024 * 1024
+                            report_started = time.monotonic()
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            if expected_bytes is not None and temporary.stat().st_size != expected_bytes:
+                raise OSError(
+                    f"Incomplete Hugging Face file {source_file.path}: "
+                    f"got {temporary.stat().st_size}, expected {expected_bytes} bytes"
+                )
+            os.replace(temporary, destination)
+            return destination
+        except OSError as exc:
+            if attempt == max_attempts:
+                raise
+            delay = min(30, 2 ** (attempt - 1))
+            print(
+                f"retry {source.name}/{source_file.path}: attempt={attempt}/{max_attempts} "
+                f"delay={delay}s error={exc}",
+                flush=True,
+            )
+            time.sleep(delay)
+    raise AssertionError("unreachable download retry state")
 
 
 def download_wikimedia_dump(

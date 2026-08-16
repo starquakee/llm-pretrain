@@ -173,6 +173,44 @@ def test_huggingface_download_resumes_part_file_atomically(tmp_path: Path, monke
     assert not part.exists()
 
 
+def test_huggingface_download_retries_transient_io_errors(tmp_path: Path, monkeypatch) -> None:
+    source = replace(
+        pinned_manifest().sources[0], files=(SourceFile(path="data/retry.parquet"),)
+    )
+
+    class FakeResponse(io.BytesIO):
+        def __init__(self) -> None:
+            super().__init__(b"done")
+            self.status = 200
+            self.headers = {"Content-Length": "4"}
+
+        def getcode(self) -> int:
+            return self.status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            self.close()
+
+    attempts = 0
+
+    def flaky_open(request, timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("temporary stall")
+        return FakeResponse()
+
+    monkeypatch.setattr("llm_pretrain.data.urlopen", flaky_open)
+    monkeypatch.setattr("llm_pretrain.data.time.sleep", lambda delay: None)
+
+    path = download_huggingface_file(source, source.files[0], tmp_path)
+
+    assert attempts == 2
+    assert path.read_bytes() == b"done"
+
+
 def test_normalization_hash_and_split_are_deterministic() -> None:
     left = "Ａ  B\r\n\r\n\r\nC  "  # noqa: RUF001
     right = "A B\n\nC"
