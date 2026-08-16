@@ -6,6 +6,9 @@ __pycache__/
 .mypy_cache/
 .pyright/
 .venv/
+.venv-wsl/
+.uv-cache/
+.uv-python/
 dist/
 build/
 *.egg-info/
@@ -47,4 +50,3 @@ scripts/ralph/.last-branch
 .idea/
 .DS_Store
 Thumbs.db
-

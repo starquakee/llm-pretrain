@@ -1,0 +1,32 @@
+seed: 1337
+validation_tokens: 10000000
+sequence_length: 1024
+shard_size_tokens: 100000000
+artifact_root: ../llm-pretrain-artifacts/data
+sources:
+  - name: ultra_fineweb_zh
+    dataset_id: openbmb/Ultra-FineWeb
+    subset: default
+    split: zh
+    text_field: content
+    revision: pin-at-prepare-time
+    license: Apache-2.0; underlying source rights may differ
+    ratio: 0.8
+    requested_tokens: 1600000000
+  - name: chinese_wikipedia
+    dataset_id: https://dumps.wikimedia.org/zhwiki/
+    subset: pages-articles-multistream
+    split: pages-articles
+    revision: pin-at-prepare-time
+    license: CC-BY-SA-4.0 and GFDL
+    ratio: 0.1
+    requested_tokens: 200000000
+  - name: fineweb_en
+    dataset_id: HuggingFaceFW/fineweb
+    subset: sample-10BT
+    split: train
+    text_field: text
+    revision: pin-at-prepare-time
+    license: ODC-By-1.0; underlying source rights may differ
+    ratio: 0.1
+    requested_tokens: 200000000

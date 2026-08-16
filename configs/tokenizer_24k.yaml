@@ -1,0 +1,8 @@
+input_globs:
+  - ../llm-pretrain-artifacts/data/prepared/train-*.jsonl
+output_prefix: ../llm-pretrain-artifacts/data/tokenizer/chinese-24k
+vocab_size: 24576
+character_coverage: 0.9995
+model_type: bpe
+byte_fallback: true
+seed: 1337
