@@ -8,6 +8,7 @@ import math
 import os
 import random
 import re
+import tempfile
 import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
@@ -495,6 +496,7 @@ class ShardManifest:
     packed_token_count: int
     dropped_token_count: int
     shards: tuple[PackedShard, ...]
+    source_token_counts: dict[str, int] = field(default_factory=dict)
     dtype: str = "uint32-le"
     version: int = 1
 
@@ -519,6 +521,104 @@ def _document_text(document: Document | str | Mapping[str, Any]) -> str:
     return text
 
 
+def _document_source(document: Document | Mapping[str, Any]) -> str:
+    if isinstance(document, Document):
+        return document.source
+    source = document.get("source")
+    if not isinstance(source, str) or not source:
+        raise ValueError("Mixed packed document mappings require a string `source` field")
+    return source
+
+
+def _validate_packing_options(
+    split: str,
+    sequence_length: int,
+    shard_token_capacity: int,
+    eos_id: int,
+) -> None:
+    if split not in {"train", "validation"}:
+        raise ValueError("split must be `train` or `validation`")
+    if sequence_length <= 0:
+        raise ValueError("sequence_length must be positive")
+    if shard_token_capacity < sequence_length + 1:
+        raise ValueError("shard_token_capacity must fit a sequence and its next-token label")
+    if not 0 <= eos_id <= UINT32_MAX:
+        raise ValueError("eos_id is outside uint32 range")
+
+
+class _StreamingShardWriter:
+    """Write fixed-capacity shards without retaining a shard-sized Python list."""
+
+    def __init__(self, output: Path, split: str, capacity: int, numpy_module: Any) -> None:
+        self.output = output
+        self.split = split
+        self.capacity = capacity
+        self.np = numpy_module
+        self.shards: list[PackedShard] = []
+        self.packed_count = 0
+        self.current_count = 0
+        self._handle: Any | None = None
+        self._temporary: Path | None = None
+
+    def _open(self) -> None:
+        if self._handle is not None:
+            return
+        index = len(self.shards)
+        final_path = self.output / f"{self.split}-{index:05d}.bin"
+        self._temporary = final_path.with_suffix(".bin.tmp")
+        self._handle = self._temporary.open("wb")
+
+    def write(self, tokens: Any) -> None:
+        array = self.np.asarray(tokens, dtype="<u4").reshape(-1)
+        position = 0
+        while position < int(array.size):
+            self._open()
+            take = min(self.capacity - self.current_count, int(array.size) - position)
+            array[position : position + take].tofile(self._handle)
+            self.current_count += take
+            position += take
+            if self.current_count == self.capacity:
+                self._finalize()
+
+    def _finalize(self) -> None:
+        if self._handle is None or self._temporary is None:
+            return
+        self._handle.flush()
+        os.fsync(self._handle.fileno())
+        self._handle.close()
+        final_path = self.output / f"{self.split}-{len(self.shards):05d}.bin"
+        os.replace(self._temporary, final_path)
+        self.shards.append(
+            PackedShard(
+                path=final_path.name,
+                token_count=self.current_count,
+                sha256=_file_sha256(final_path),
+            )
+        )
+        self.packed_count += self.current_count
+        self.current_count = 0
+        self._handle = None
+        self._temporary = None
+
+    def finish(self, minimum_final_tokens: int) -> tuple[tuple[PackedShard, ...], int, int]:
+        if self.current_count >= minimum_final_tokens:
+            self._finalize()
+            dropped = 0
+        else:
+            dropped = self.current_count
+            self.abort()
+        return tuple(self.shards), self.packed_count, dropped
+
+    def abort(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+        if self._temporary is not None:
+            self._temporary.unlink(missing_ok=True)
+        self.current_count = 0
+        self._handle = None
+        self._temporary = None
+
+
 def pack_token_shards(
     documents: Iterable[Document | str | Mapping[str, Any]],
     tokenizer: TokenizerProtocol,
@@ -536,15 +636,8 @@ def pack_token_shards(
     padded.  Full shards retain a continuous stream and readers intentionally
     do not construct examples across physical shard boundaries.
     """
-    if split not in {"train", "validation"}:
-        raise ValueError("split must be `train` or `validation`")
-    if sequence_length <= 0:
-        raise ValueError("sequence_length must be positive")
-    if shard_token_capacity < sequence_length + 1:
-        raise ValueError("shard_token_capacity must fit a sequence and its next-token label")
     resolved_eos = tokenizer.eos_id if eos_id is None else eos_id
-    if not 0 <= resolved_eos <= UINT32_MAX:
-        raise ValueError("eos_id is outside uint32 range")
+    _validate_packing_options(split, sequence_length, shard_token_capacity, resolved_eos)
 
     try:
         import numpy as np
@@ -553,38 +646,21 @@ def pack_token_shards(
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    buffer: list[int] = []
-    shards: list[PackedShard] = []
-    document_count = encoded_count = packed_count = 0
-
-    def write_shard(tokens: Sequence[int]) -> None:
-        nonlocal packed_count
-        index = len(shards)
-        path = output / f"{split}-{index:05d}.bin"
-        temporary = path.with_suffix(".bin.tmp")
-        array = np.asarray(tokens, dtype="<u4")
-        array.tofile(temporary)
-        os.replace(temporary, path)
-        digest = _file_sha256(path)
-        shards.append(PackedShard(path=path.name, token_count=len(tokens), sha256=digest))
-        packed_count += len(tokens)
-
-    for document in documents:
-        ids = [int(token_id) for token_id in tokenizer.encode(_document_text(document))]
-        ids.append(int(resolved_eos))
-        if any(token_id < 0 or token_id > UINT32_MAX for token_id in ids):
-            raise ValueError("Tokenizer emitted an id outside uint32 range")
-        buffer.extend(ids)
-        document_count += 1
-        encoded_count += len(ids)
-        while len(buffer) >= shard_token_capacity:
-            write_shard(buffer[:shard_token_capacity])
-            del buffer[:shard_token_capacity]
-
-    if len(buffer) >= sequence_length + 1:
-        write_shard(buffer)
-        buffer = []
-    dropped_count = len(buffer)
+    writer = _StreamingShardWriter(output, split, shard_token_capacity, np)
+    document_count = encoded_count = 0
+    try:
+        for document in documents:
+            ids = [int(token_id) for token_id in tokenizer.encode(_document_text(document))]
+            ids.append(int(resolved_eos))
+            if any(token_id < 0 or token_id > UINT32_MAX for token_id in ids):
+                raise ValueError("Tokenizer emitted an id outside uint32 range")
+            writer.write(ids)
+            document_count += 1
+            encoded_count += len(ids)
+        shards, packed_count, dropped_count = writer.finish(sequence_length + 1)
+    except BaseException:
+        writer.abort()
+        raise
     manifest = ShardManifest(
         split=split,
         sequence_length=sequence_length,
@@ -593,7 +669,128 @@ def pack_token_shards(
         encoded_token_count=encoded_count,
         packed_token_count=packed_count,
         dropped_token_count=dropped_count,
-        shards=tuple(shards),
+        shards=shards,
+    )
+    _atomic_json_write(output / f"{split}-shards.json", manifest.to_dict())
+    return manifest
+
+
+def pack_mixed_token_shards(
+    documents: Iterable[Document | Mapping[str, Any]],
+    tokenizer: TokenizerProtocol,
+    output_dir: str | Path,
+    *,
+    split: str,
+    source_token_quotas: Mapping[str, int],
+    sequence_length: int = DEFAULT_SEQUENCE_LENGTH,
+    shard_token_capacity: int = 16 * 1024 * 1024,
+    eos_id: int | None = None,
+) -> ShardManifest:
+    """Pack an exact deterministic source mix using disk-backed source buffers.
+
+    Each source is capped at its requested token count after tokenization. Source
+    streams are then interleaved with smooth weighted round-robin scheduling in
+    ``sequence_length``-sized chunks. Temporary buffers live beside the output
+    shards, so the operation needs bounded RAM even for billion-token corpora.
+    """
+
+    quotas = {str(name): int(value) for name, value in source_token_quotas.items()}
+    if not quotas or any(not name or value <= 0 for name, value in quotas.items()):
+        raise ValueError("source_token_quotas must contain positive counts")
+    resolved_eos = tokenizer.eos_id if eos_id is None else eos_id
+    _validate_packing_options(split, sequence_length, shard_token_capacity, resolved_eos)
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - core project dependency
+        raise RuntimeError("numpy is required to write packed token shards") from exc
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    source_order = tuple(quotas)
+    counts = dict.fromkeys(source_order, 0)
+    document_count = 0
+
+    with tempfile.TemporaryDirectory(prefix=f".{split}-source-tokens-", dir=output) as raw_temp:
+        temp_root = Path(raw_temp)
+        temp_paths = {
+            name: temp_root / f"source-{index:03d}.bin" for index, name in enumerate(source_order)
+        }
+        handles = {name: path.open("wb") for name, path in temp_paths.items()}
+        try:
+            for document in documents:
+                if all(counts[name] >= quotas[name] for name in source_order):
+                    break
+                source = _document_source(document)
+                if source not in quotas:
+                    raise ValueError(f"Document belongs to unknown source {source!r}")
+                remaining = quotas[source] - counts[source]
+                if remaining <= 0:
+                    continue
+                ids = [int(token_id) for token_id in tokenizer.encode(_document_text(document))]
+                ids.append(int(resolved_eos))
+                if any(token_id < 0 or token_id > UINT32_MAX for token_id in ids):
+                    raise ValueError("Tokenizer emitted an id outside uint32 range")
+                if len(ids) > remaining:
+                    ids = ids[:remaining]
+                    ids[-1] = int(resolved_eos)
+                np.asarray(ids, dtype="<u4").tofile(handles[source])
+                counts[source] += len(ids)
+                document_count += 1
+        finally:
+            for handle in handles.values():
+                handle.close()
+
+        deficits = {
+            name: quotas[name] - counts[name]
+            for name in source_order
+            if counts[name] < quotas[name]
+        }
+        if deficits:
+            formatted = ", ".join(f"{name}={value}" for name, value in deficits.items())
+            raise ValueError(f"Prepared corpus is short of requested tokens: {formatted}")
+
+        writer = _StreamingShardWriter(output, split, shard_token_capacity, np)
+        readers = {name: path.open("rb") for name, path in temp_paths.items()}
+        remaining_by_source = dict(counts)
+        total_tokens = sum(counts.values())
+        weights = {name: counts[name] / total_tokens for name in source_order}
+        credits = dict.fromkeys(source_order, 0.0)
+        source_rank = {name: index for index, name in enumerate(source_order)}
+        mix_chunk_tokens = max(
+            sequence_length,
+            min(shard_token_capacity, sequence_length * 64),
+        )
+        try:
+            while any(remaining_by_source.values()):
+                active = [name for name in source_order if remaining_by_source[name] > 0]
+                for name in active:
+                    credits[name] += weights[name]
+                chosen = max(active, key=lambda name: (credits[name], -source_rank[name]))
+                take = min(mix_chunk_tokens, remaining_by_source[chosen])
+                chunk = np.fromfile(readers[chosen], dtype="<u4", count=take)
+                if int(chunk.size) != take:
+                    raise RuntimeError(f"Temporary token stream ended early for {chosen}")
+                writer.write(chunk)
+                remaining_by_source[chosen] -= take
+                credits[chosen] -= take / mix_chunk_tokens
+            shards, packed_count, dropped_count = writer.finish(sequence_length + 1)
+        except BaseException:
+            writer.abort()
+            raise
+        finally:
+            for reader in readers.values():
+                reader.close()
+
+    manifest = ShardManifest(
+        split=split,
+        sequence_length=sequence_length,
+        eos_id=int(resolved_eos),
+        document_count=document_count,
+        encoded_token_count=total_tokens,
+        packed_token_count=packed_count,
+        dropped_token_count=dropped_count,
+        shards=shards,
+        source_token_counts=counts,
     )
     _atomic_json_write(output / f"{split}-shards.json", manifest.to_dict())
     return manifest

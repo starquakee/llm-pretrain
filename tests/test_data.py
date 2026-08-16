@@ -19,6 +19,7 @@ from llm_pretrain.data import (
     document_sha256,
     iter_wikimedia_documents,
     normalize_document,
+    pack_mixed_token_shards,
     pack_token_shards,
     prepare_document_corpus,
     resolve_source_revisions,
@@ -209,3 +210,59 @@ def test_short_tail_is_dropped_instead_of_padded(tmp_path: Path) -> None:
     )
     with pytest.raises(StopIteration):
         reader.next_batch()
+
+
+def test_mixed_packer_enforces_exact_source_quotas_deterministically(tmp_path: Path) -> None:
+    documents = [
+        Document("a" * 20, "zh-web"),
+        Document("b" * 20, "wiki"),
+        Document("c" * 20, "en-web"),
+    ]
+    quotas = {"zh-web": 12, "wiki": 4, "en-web": 4}
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+
+    first = pack_mixed_token_shards(
+        documents,
+        CharacterTokenizer(),
+        first_dir,
+        split="train",
+        source_token_quotas=quotas,
+        sequence_length=4,
+        shard_token_capacity=10,
+    )
+    second = pack_mixed_token_shards(
+        documents,
+        CharacterTokenizer(),
+        second_dir,
+        split="train",
+        source_token_quotas=quotas,
+        sequence_length=4,
+        shard_token_capacity=10,
+    )
+
+    assert first.source_token_counts == quotas
+    assert first.encoded_token_count == 20
+    assert first.packed_token_count == 20
+    assert first.dropped_token_count == 0
+    assert [shard.token_count for shard in first.shards] == [10, 10]
+    for first_shard, second_shard in zip(first.shards, second.shards, strict=True):
+        assert (first_dir / first_shard.path).read_bytes() == (
+            second_dir / second_shard.path
+        ).read_bytes()
+
+
+def test_mixed_packer_reports_source_deficits_and_removes_temporary_files(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match=r"wiki=10"):
+        pack_mixed_token_shards(
+            [Document("a" * 20, "zh-web")],
+            CharacterTokenizer(),
+            tmp_path,
+            split="train",
+            source_token_quotas={"zh-web": 10, "wiki": 10},
+            sequence_length=4,
+            shard_token_capacity=10,
+        )
+    assert not list(tmp_path.glob(".train-source-tokens-*"))
