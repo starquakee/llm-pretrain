@@ -9,12 +9,15 @@ import os
 import random
 import re
 import tempfile
+import time
 import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 from llm_pretrain.tokenization import TokenizerProtocol
 
@@ -426,19 +429,12 @@ def iter_huggingface_documents(
     if source.files and download_dir is not None:
         try:
             import pyarrow.parquet as parquet
-            from huggingface_hub import hf_hub_download
         except ImportError as exc:  # pragma: no cover - required production dependencies
-            raise RuntimeError("pyarrow and huggingface_hub are required for pinned files") from exc
+            raise RuntimeError("pyarrow is required for pinned parquet files") from exc
         local_root = Path(download_dir)
         local_root.mkdir(parents=True, exist_ok=True)
         for source_file in source.files:
-            local_path = hf_hub_download(
-                repo_id=source.repository,
-                filename=source_file.path,
-                repo_type="dataset",
-                revision=source.revision,
-                local_dir=local_root,
-            )
+            local_path = download_huggingface_file(source, source_file, local_root)
             with Path(local_path).open("rb") as handle:
                 parquet_file = parquet.ParquetFile(handle)
                 columns = [source.text_field]
@@ -475,6 +471,81 @@ def iter_huggingface_documents(
         yield _coerce_document(cast(Mapping[str, Any], record), source)
 
 
+def download_huggingface_file(
+    source: SourceSpec,
+    source_file: SourceFile,
+    output_dir: str | Path,
+    *,
+    chunk_size: int = 8 * 1024 * 1024,
+) -> Path:
+    """Download one pinned Hub file with resumable, atomic HTTP writes."""
+    if source.provider != "huggingface":
+        raise ValueError(f"{source.name} is not a Hugging Face source")
+    if source.revision in {"main", "master"}:
+        raise ValueError("Resolve the source revision before downloading data")
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    output = Path(output_dir).resolve()
+    destination = (output / source_file.path).resolve()
+    if not destination.is_relative_to(output):
+        raise ValueError("Hugging Face file path escapes the download directory")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_file():
+        return destination
+
+    temporary = destination.with_suffix(destination.suffix + ".part")
+    existing_bytes = temporary.stat().st_size if temporary.is_file() else 0
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
+    repository = quote(source.repository, safe="/")
+    revision = quote(source.revision, safe="")
+    filename = quote(source_file.path, safe="/")
+    url = f"{endpoint}/datasets/{repository}/resolve/{revision}/{filename}"
+    headers = {"User-Agent": "llm-pretrain/0.1 pinned data download"}
+    if existing_bytes:
+        headers["Range"] = f"bytes={existing_bytes}-"
+    request = Request(url, headers=headers)
+    with urlopen(request, timeout=60) as response:
+        status = int(getattr(response, "status", response.getcode()))
+        append = existing_bytes > 0 and status == 206
+        initial_bytes = existing_bytes if append else 0
+        content_range = response.headers.get("Content-Range")
+        content_length = response.headers.get("Content-Length")
+        expected_bytes: int | None = None
+        if content_range and "/" in content_range:
+            total = content_range.rsplit("/", maxsplit=1)[1]
+            if total.isdigit():
+                expected_bytes = int(total)
+        elif content_length and content_length.isdigit():
+            expected_bytes = initial_bytes + int(content_length)
+
+        mode = "ab" if append else "wb"
+        downloaded = initial_bytes
+        next_report = downloaded + 256 * 1024 * 1024
+        report_started = time.monotonic()
+        with temporary.open(mode) as handle:
+            while chunk := response.read(chunk_size):
+                handle.write(chunk)
+                downloaded += len(chunk)
+                if downloaded >= next_report or time.monotonic() - report_started >= 60:
+                    total_label = str(expected_bytes) if expected_bytes is not None else "unknown"
+                    print(
+                        f"download {source.name}/{source_file.path}: "
+                        f"{downloaded}/{total_label} bytes",
+                        flush=True,
+                    )
+                    next_report = downloaded + 256 * 1024 * 1024
+                    report_started = time.monotonic()
+            handle.flush()
+            os.fsync(handle.fileno())
+    if expected_bytes is not None and temporary.stat().st_size != expected_bytes:
+        raise OSError(
+            f"Incomplete Hugging Face file {source_file.path}: "
+            f"got {temporary.stat().st_size}, expected {expected_bytes} bytes"
+        )
+    os.replace(temporary, destination)
+    return destination
+
+
 def download_wikimedia_dump(
     source: SourceSpec,
     output_dir: str | Path,
@@ -488,8 +559,6 @@ def download_wikimedia_dump(
         raise ValueError("A Wikimedia source must list exactly one pages-articles dump")
     if chunk_size <= 0:
         raise ValueError("chunk_size must be positive")
-
-    from urllib.request import Request, urlopen
 
     source_file = source.files[0]
     revision_path = source.revision.replace("-", "")

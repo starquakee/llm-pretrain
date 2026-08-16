@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bz2
+import io
 import json
 from collections.abc import Sequence
 from dataclasses import replace
@@ -20,6 +21,7 @@ from llm_pretrain.data import (
     SourceManifest,
     allocate_token_quotas,
     document_sha256,
+    download_huggingface_file,
     download_wikimedia_dump,
     iter_huggingface_documents,
     iter_wikimedia_documents,
@@ -119,9 +121,7 @@ def test_pinned_huggingface_parquet_is_read_in_batches(tmp_path: Path, monkeypat
         pinned_manifest().sources[0],
         files=(SourceFile(path="data/fixture.parquet"),),
     )
-    import huggingface_hub
-
-    monkeypatch.setattr(huggingface_hub, "hf_hub_download", lambda **kwargs: str(shard))
+    monkeypatch.setattr("llm_pretrain.data.download_huggingface_file", lambda *args: shard)
 
     documents = list(iter_huggingface_documents(source, download_dir=tmp_path / "downloads"))
 
@@ -129,6 +129,48 @@ def test_pinned_huggingface_parquet_is_read_in_batches(tmp_path: Path, monkeypat
         Document("中文一", source.name, "first"),
         Document("中文二", source.name, "second"),
     ]
+
+
+def test_huggingface_download_reuses_existing_pinned_file(tmp_path: Path) -> None:
+    source = replace(
+        pinned_manifest().sources[0], files=(SourceFile(path="data/fixture.parquet"),)
+    )
+    destination = tmp_path / source.files[0].path
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"complete")
+
+    assert download_huggingface_file(source, source.files[0], tmp_path) == destination
+
+
+def test_huggingface_download_resumes_part_file_atomically(tmp_path: Path, monkeypatch) -> None:
+    source = replace(
+        pinned_manifest().sources[0], files=(SourceFile(path="data/fixture.parquet"),)
+    )
+    destination = tmp_path / source.files[0].path
+    destination.parent.mkdir(parents=True)
+    part = destination.with_suffix(".parquet.part")
+    part.write_bytes(b"abc")
+
+    class FakeResponse(io.BytesIO):
+        def __init__(self, value: bytes) -> None:
+            super().__init__(value)
+            self.status = 206
+            self.headers = {"Content-Range": "bytes 3-5/6", "Content-Length": "3"}
+
+        def getcode(self) -> int:
+            return self.status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            self.close()
+
+    monkeypatch.setattr("llm_pretrain.data.urlopen", lambda request, timeout: FakeResponse(b"def"))
+
+    assert download_huggingface_file(source, source.files[0], tmp_path) == destination
+    assert destination.read_bytes() == b"abcdef"
+    assert not part.exists()
 
 
 def test_normalization_hash_and_split_are_deterministic() -> None:
