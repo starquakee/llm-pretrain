@@ -69,6 +69,7 @@ from .training import (
     read_nvidia_temperature_c,
     train,
 )
+from .web import GenerationService, serve_generation_ui
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PRETRAIN_SECTIONS = frozenset({"model", "data", "optimizer", "train"})
@@ -1038,6 +1039,22 @@ def _command_generate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _command_serve(args: argparse.Namespace) -> int:
+    configs = _load_command_configs(args)
+    checkpoint = args.checkpoint or _checkpoint_default(configs)
+    model, tokenizer = _model_and_tokenizer(configs, checkpoint, args.tokenizer)
+    model.to(configs.train.device)
+    model.eval()
+    service = GenerationService(
+        model,
+        tokenizer,
+        checkpoint=str(_resolve_path(checkpoint)),
+        use_bf16=configs.train.dtype == "bfloat16",
+    )
+    serve_generation_ui(service, host=args.host, port=args.port)
+    return 0
+
+
 def _add_config_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--config", required=True, help="YAML configuration path")
 
@@ -1149,6 +1166,14 @@ def build_parser() -> argparse.ArgumentParser:
     generation.add_argument("--top-k", type=int, default=50)
     generation.add_argument("--seed", type=int, default=42)
     generation.set_defaults(handler=_command_generate)
+
+    serve = commands.add_parser("serve", help="launch the local-only browser test bench")
+    _add_config_argument(serve)
+    serve.add_argument("--checkpoint")
+    serve.add_argument("--tokenizer")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=7860)
+    serve.set_defaults(handler=_command_serve)
     return parser
 
 

@@ -82,6 +82,7 @@ def test_parser_exposes_complete_command_tree() -> None:
         ["train", "sft", "--config", "sft.yaml"],
         ["evaluate", "--config", "x.yaml"],
         ["generate", "--config", "x.yaml", "--prompt", "你好"],
+        ["serve", "--config", "x.yaml"],
     ):
         assert callable(parser.parse_args(argv).handler)
 

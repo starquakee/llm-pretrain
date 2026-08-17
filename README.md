@@ -56,6 +56,7 @@ uv run llm-pretrain train ab --config configs/pretrain_100m_muon.yaml
 uv run llm-pretrain evaluate --config configs/pretrain_100m_muon.yaml
 uv run llm-pretrain train sft --config configs/sft_coig.yaml --allow-network
 uv run llm-pretrain generate --config configs/pretrain_100m_muon.yaml --prompt "杭州是一座"
+uv run llm-pretrain serve --config configs/pretrain_100m_muon.yaml --port 7860
 ```
 
 真实数据命令要求显式设置仓库外目录，例如：
@@ -94,6 +95,22 @@ uv run tensorboard --logdir "$LLM_PRETRAIN_ARTIFACT_ROOT/runs"
 ```
 
 JSONL 和 TensorBoard 记录 loss、学习率、梯度范数、吞吐、显存、温度、评测与 checkpoint 事件。
+
+### 本地浏览器测试
+
+`serve` 会在进程启动时加载最佳 checkpoint，并提供一个无需额外前端依赖的测试页。服务强制
+绑定回环地址，不会暴露到局域网或公网：
+
+```bash
+export LLM_PRETRAIN_ARTIFACT_ROOT=/home/starquake/Desktop/llm-pretrain-artifacts
+uv run llm-pretrain serve \
+  --config configs/pretrain_100m_muon.yaml \
+  --host 127.0.0.1 \
+  --port 7860
+```
+
+然后在 Windows 浏览器打开 `http://127.0.0.1:7860`。页面会显示采样参数、生成耗时、
+token 数和 checkpoint 信息。当前 checkpoint 是未完成 SFT 的 base 模型，输出可能重复或捏造事实。
 
 ## 模型与优化器
 
